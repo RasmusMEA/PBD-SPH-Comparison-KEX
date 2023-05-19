@@ -1,0 +1,242 @@
+﻿float HashScale;
+float3 HashSize;
+float3 HashTranslate;
+
+RWStructuredBuffer<int2> IndexMap;
+RWStructuredBuffer<int2> Table;
+
+int3 HashIndex(float3 p) {
+	p = (p - HashTranslate) * HashScale;
+	return clamp(p, 0, HashSize - 1);
+}
+
+float KernelRadius;
+float KernelRadius2;
+
+float Poly6Zero;
+float Poly6;
+float SpikyGrad;
+float ViscLap;
+
+float Pow2(float v) {
+	return v * v;
+}
+
+float Pow3(float v) {
+	return v * v * v;
+}
+
+float Poly6Kernel(float len2) {
+	return Poly6 * Pow3(KernelRadius2 - len2);
+}
+
+float3 SpikyGradKernel(float3 p, float len2) {
+	float r = sqrt(len2);
+	return (p / r) * SpikyGrad * Pow2(KernelRadius - r);
+}
+
+float ViscLapKernel(float len2) {
+	float r = sqrt(len2);
+	return ViscLap * (KernelRadius - r);
+}
+
+/* 	FOREACH_NEIGHBOR (float3 pi -> int n)
+	1. Hash particle position (pi)
+	2. Loop over all neighbor cells
+	3. Check if cell is inside bounds
+	4. Get list of neighbors from Table (start, end = bounds)
+	4. Loop over neighbors
+	5. Get neighbor index 'n' from IndexMap
+*/
+
+#define FOREACH_NEIGHBOR \
+int3 hashIndex = HashIndex(pi); \
+int3 size = HashSize; \
+int sizexy = size.x * size.y; \
+\
+[unroll] \
+for (int k = -1; k <= 1; k++) { \
+[unroll] \
+for (int j = -1; j <= 1; j++) { \
+[unroll] \
+for (int i = -1; i <= 1; i++) { \
+\
+int3 cell = int3(i, j, k) + hashIndex; \
+int3 insideBounds = (cell < 0) + (cell >= size); \
+if (dot(insideBounds, insideBounds) != 0) continue; \
+\
+int hash = cell.x + cell.y * size.x + cell.z * sizexy; \
+int2 bounds = Table[hash]; \
+\
+for (int idx = bounds.x; idx <= bounds.y; idx++) { \
+	int n = IndexMap[idx].y; \
+
+#define FOREACH_NEIGHBOR_END \
+} } } } \
+
+#define THREADS 128
+#define PI 3.14159265359
+
+RWStructuredBuffer<float4> Positions;
+StructuredBuffer<float4> PredictedREAD;
+RWStructuredBuffer<float4> PredictedWRITE;
+StructuredBuffer<float4> VelocitiesREAD;
+RWStructuredBuffer<float4> VelocitiesWRITE;
+RWStructuredBuffer<float> Densities;
+RWStructuredBuffer<float> Pressures;
+
+StructuredBuffer<float4> Boundary;
+
+float3 Gravity;
+float Dampning;
+float DeltaTime;
+float Density;
+float InvDensity;
+float Viscosity;
+float ParticleMass;
+float BoundaryPSI;
+int NumParticles;
+
+#pragma kernel PredictPositions
+
+[numthreads(THREADS,1,1)]
+void PredictPositions(int id : SV_DispatchThreadID) {
+	if (id >= NumParticles) return;
+	
+	float3 velocity = VelocitiesREAD[id].xyz;
+
+	velocity += (-velocity * Dampning + Gravity) * DeltaTime;
+
+	float3 predicted = Positions[id].xyz + velocity * DeltaTime;
+
+	VelocitiesWRITE[id] = float4(velocity, 0);
+	PredictedWRITE[id] = float4(predicted, 0);
+}
+
+#pragma kernel ComputeDensityAndPressure
+
+[numthreads(THREADS, 1, 1)]
+void ComputeDensityAndPressure(int id : SV_DispatchThreadID) {
+	if (id >= NumParticles) return;
+
+	float3 pi = PredictedREAD[id].xyz;
+
+	float density = ParticleMass * Poly6Zero;
+	float pressure = 0;
+
+	float sum_grad_C2 = 0.0f;
+	float3 gradC_i = 0.0f;
+
+	FOREACH_NEIGHBOR
+		if (n == id) continue;
+
+		bool isParticle = n < NumParticles;
+		
+		float3 diff = pi - (isParticle ? PredictedREAD[n].xyz : Boundary[n - NumParticles].xyz);
+		float dist2 = dot(diff, diff);
+
+		if (dist2 >= KernelRadius2) continue;
+
+		density += (isParticle ? ParticleMass : BoundaryPSI) * Poly6Kernel(dist2);
+		float3 gradC_j = -(isParticle ? ParticleMass : BoundaryPSI) * InvDensity * SpikyGradKernel(diff, dist2);
+		sum_grad_C2 += dot(gradC_j, gradC_j);
+		gradC_i -= gradC_j;
+
+	FOREACH_NEIGHBOR_END
+
+	float C = density * InvDensity - 1.0f;
+
+	if (C > 0) {
+		// C > 0 for 60% - 65% of particles
+		sum_grad_C2 += dot(gradC_i, gradC_i);
+	
+		//If the fluid is collapsing you need to adjust e.
+		//Its a user specified relaxation parameter that 
+		//needs to be added to stabilze the pressure
+		//due to a vanishing gradient at the smoothing 
+		//kernel borders. The value may need to increase
+		//as the number of particles increase.
+		float e = 60.0f;
+		pressure = -C / (sum_grad_C2 + e);
+	}
+
+	Densities[id] = density;
+	Pressures[id] = pressure;
+}
+
+#pragma kernel SolveConstraint
+
+[numthreads(THREADS, 1, 1)]
+void SolveConstraint(int id : SV_DispatchThreadID) {
+	if (id >= NumParticles) return;
+
+	float3 pi = PredictedREAD[id].xyz;
+	float pressure = Pressures[id];
+
+	float3 corr = 0;
+
+	FOREACH_NEIGHBOR
+		if (n == id) continue;
+
+		bool isParticle = n < NumParticles;
+		
+		float3 diff = pi - (isParticle ? PredictedREAD[n].xyz : Boundary[n - NumParticles].xyz);
+		float dist2 = dot(diff, diff);
+
+		if (dist2 >= KernelRadius2) continue;
+
+		float3 gradW = SpikyGradKernel(diff, dist2);
+		corr -= -(isParticle ? (pressure + Pressures[n]) * ParticleMass : pressure * BoundaryPSI) * InvDensity * gradW;
+
+	FOREACH_NEIGHBOR_END
+
+	pi += corr;
+	
+	PredictedWRITE[id] = float4(pi, 0);
+}
+
+#pragma kernel UpdateVelocities
+
+[numthreads(THREADS, 1, 1)]
+void UpdateVelocities(int id : SV_DispatchThreadID) {
+	if (id < NumParticles) {
+		VelocitiesWRITE[id] = (PredictedREAD[id] - Positions[id]) / DeltaTime;
+	}
+}
+
+#pragma kernel SolveViscosity
+
+[numthreads(THREADS, 1, 1)]
+void SolveViscosity(int id : SV_DispatchThreadID) {
+	if (id >= NumParticles) return;
+
+	float3 pi = PredictedREAD[id].xyz;
+	float3 velocity = VelocitiesREAD[id].xyz;
+
+	// Compute viscosity
+	float viscosityMulMass = Viscosity * ParticleMass;
+
+	FOREACH_NEIGHBOR
+		if (n == id || n >= NumParticles) continue;
+
+		float3 diff = pi - PredictedREAD[n].xyz;
+		float dist2 = dot(diff, diff);
+
+		if (dist2 >= KernelRadius2) continue;
+
+		float v = ViscLapKernel(dist2) * viscosityMulMass / Densities[n];
+		velocity -= v * (velocity - VelocitiesREAD[n].xyz);
+
+	FOREACH_NEIGHBOR_END
+
+	VelocitiesWRITE[id] = float4(velocity, 0);
+}
+
+#pragma kernel UpdatePositions
+
+[numthreads(THREADS, 1, 1)]
+void UpdatePositions(int id : SV_DispatchThreadID) {
+	if (id < NumParticles) {
+		Positions[id] = PredictedREAD[id];
+	}
+}

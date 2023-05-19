@@ -1,0 +1,195 @@
+float HashScale;
+float3 HashSize;
+float3 HashTranslate;
+
+RWStructuredBuffer<int2> IndexMap;
+RWStructuredBuffer<int2> Table;
+
+int3 HashIndex(float3 p) {
+	p = (p - HashTranslate) * HashScale;
+	return clamp(p, 0, HashSize - 1);
+}
+
+float KernelRadius;
+float KernelRadius2;
+
+float Poly6Zero;
+float Poly6;
+float SpikyGrad;
+float ViscLap;
+
+float Pow2(float v) {
+	return v * v;
+}
+
+float Pow3(float v) {
+	return v * v * v;
+}
+
+float Poly6Kernel(float len2) {
+	return Poly6 * Pow3(KernelRadius2 - len2);
+}
+
+float3 SpikyGradKernel(float3 p, float len2) {
+	float r = sqrt(len2);
+	return (p / r) * SpikyGrad * Pow2(KernelRadius - r);
+}
+
+float ViscLapKernel(float len2) {
+	float r = sqrt(len2);
+	return ViscLap * (KernelRadius - r);
+}
+
+/* 	FOREACH_NEIGHBOR (float3 pi -> int n)
+	1. Hash particle position (pi)
+	2. Loop over all neighbor cells
+	3. Check if cell is inside bounds
+	4. Get list of neighbors from Table (start, end = bounds)
+	4. Loop over neighbors
+	5. Get neighbor index 'n' from IndexMap
+*/
+
+#define FOREACH_NEIGHBOR \
+int3 hashIndex = HashIndex(pi); \
+int3 size = HashSize; \
+int sizexy = size.x * size.y; \
+\
+[unroll] \
+for (int k = -1; k <= 1; k++) { \
+[unroll] \
+for (int j = -1; j <= 1; j++) { \
+[unroll] \
+for (int i = -1; i <= 1; i++) { \
+\
+int3 cell = int3(i, j, k) + hashIndex; \
+int3 insideBounds = (cell < 0) + (cell >= size); \
+if (dot(insideBounds, insideBounds) != 0) continue; \
+\
+int hash = cell.x + cell.y * size.x + cell.z * sizexy; \
+int2 bounds = Table[hash]; \
+\
+for (int idx = bounds.x; idx <= bounds.y; idx++) { \
+	int n = IndexMap[idx].y; \
+
+#define FOREACH_NEIGHBOR_END \
+} } } } \
+
+#define THREADS 128
+#define PI 3.14159265359
+
+RWStructuredBuffer<float4> Positions;
+RWStructuredBuffer<float4> Forces;
+RWStructuredBuffer<float4> Velocities;
+RWStructuredBuffer<float> Densities;
+RWStructuredBuffer<float> Pressures;
+
+StructuredBuffer<float4> Boundary;
+
+float3 Gravity;
+float Dampning;
+float DeltaTime;
+float RestDensity;
+float Viscosity;
+float ParticleMass;
+float GasConstant;
+float BoundaryPSI;
+int NumParticles;
+
+float StdKernel(float distanceSquared) {
+    // Doyub Kim
+    float x = 1.0f - distanceSquared / KernelRadius2;
+    return 315.f / (64.f * PI * Pow3(KernelRadius)) * x * x * x;
+}
+
+// Doyub Kim page 130
+float SpikyKernelFirstDerivative(float distance) {
+    float x = 1.0f - distance / KernelRadius;
+    return -45.0f / (PI * KernelRadius2 * KernelRadius2) * x * x;
+}
+
+// Doyub Kim page 130
+float SpikyKernelSecondDerivative(float distance) {
+    // Btw, it derives 'distance' not 'radius' (h)
+    float x = 1.0f - distance / KernelRadius;
+    return 90.f / (PI * KernelRadius2 * KernelRadius2 * KernelRadius) * x;
+}
+
+// Doyub Kim page 130
+float3 SpikyKernelGradient(float distance, float3 directionFromCenter) {
+    return SpikyKernelFirstDerivative(distance) * directionFromCenter;
+}
+
+#pragma kernel ComputeDensity
+
+[numthreads(THREADS, 1, 1)]
+void ComputeDensity(int id : SV_DispatchThreadID) {
+	if (id < NumParticles) {
+		float density = 0.000001f;
+        float pressure;
+        float3 pi = Positions[id].xyz;
+
+        FOREACH_NEIGHBOR
+            if (n == id) continue;
+
+            bool isParticle = n < NumParticles;
+
+            const float3 diff = pi - (isParticle ? Positions[n].xyz : Boundary[n - NumParticles].xyz);
+            float distanceSquared = dot(diff, diff);
+
+            if (distanceSquared >= KernelRadius2) continue;
+            density += StdKernel(distanceSquared) * (isParticle ? ParticleMass : BoundaryPSI);
+
+        FOREACH_NEIGHBOR_END
+
+        Densities[id] = density;
+        Pressures[id] = GasConstant * (density - RestDensity); // 6. Compute pressure based on density as described in Müller et al Equation 12
+	}
+}
+
+#pragma kernel ComputeForces
+
+[numthreads(THREADS, 1, 1)]
+void ComputeForces(int id : SV_DispatchThreadID) {
+	if (id < NumParticles) {
+        float3 force = float3(0, 0, 0);
+        float3 pi = Positions[id].xyz;
+        float3 velocity = Velocities[id].xyz;
+        float density = Densities[id];
+        float pressure = Pressures[id];
+
+        FOREACH_NEIGHBOR
+            if (n == id) continue;
+
+            bool isParticle = n < NumParticles;
+
+            const float3 diff = pi - (isParticle ? Positions[n].xyz : Boundary[n - NumParticles].xyz);
+            const float distance = length(diff);
+
+            if (distance > KernelRadius || distance <= 0.0f) continue;
+            const float3 direction = normalize(diff);
+
+            // 7. Compute pressure gradient force (Doyub Kim page 136)
+            force -= (isParticle ? (pressure / pow(density, 2) + Pressures[n] / pow(Densities[n], 2)) : 1000) * SpikyKernelGradient(distance, direction) * Pow2(isParticle ? ParticleMass : BoundaryPSI);   // Kim
+
+            if (!isParticle) continue;
+
+            // 8. Compute the viscosity force
+            force += Viscosity * (Velocities[n].xyz - velocity) / Densities[n] * SpikyKernelSecondDerivative(distance) * Pow2(ParticleMass);    // Kim
+            
+        FOREACH_NEIGHBOR_END
+
+        Forces[id] = float4(force + Gravity, 0);
+	}
+}
+
+#pragma kernel Integrate
+
+[numthreads(THREADS, 1, 1)]
+void Integrate(int id : SV_DispatchThreadID) {
+	if (id < NumParticles) {
+        
+        // forward Euler integration
+        Velocities[id] += float4(DeltaTime * Forces[id].xyz / ParticleMass, 0);
+        Positions[id] += float4(DeltaTime * Velocities[id].xyz, 0);
+    }
+}
